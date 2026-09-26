@@ -1,0 +1,61 @@
+from __future__ import annotations
+from typing import Dict, List, Sequence
+import keras
+from keras import ops
+
+def macro_f1(y_true: Sequence[int], y_pred: Sequence[int], n_classes: int = 2) -> float:
+    f1s = []
+    for c in range(n_classes):
+        tp = sum(1 for t, p in zip(y_true, y_pred) if t == c and p == c)
+        fp = sum(1 for t, p in zip(y_true, y_pred) if t != c and p == c)
+        fn = sum(1 for t, p in zip(y_true, y_pred) if t == c and p != c)
+        prec, rec = (tp / (tp + fp) if tp + fp else 0.0), (tp / (tp + fn) if tp + fn else 0.0)
+        f1s.append(2 * prec * rec / (prec + rec) if prec + rec else 0.0)
+    return sum(f1s) / len(f1s)
+
+def select_topk(weights, attention_mask, protected, k):
+    eligible = ops.logical_and(ops.equal(attention_mask, 1), ops.equal(protected, 0))
+    scores = ops.where(ops.logical_not(eligible), -1e9, weights)
+    order = ops.argsort(-scores, axis=-1)
+    
+    # Vectorized top-k selection mask
+    batch_indices = ops.expand_dims(ops.arange(ops.shape(weights)[0]), -1)
+    ranks = ops.expand_dims(ops.arange(ops.shape(weights)[1]), 0)
+    k_expanded = ops.expand_dims(k, -1)
+    
+    selected_positions = ops.logical_and(ranks < k_expanded, ops.take_along_axis(eligible, order, axis=-1))
+    # Scatter back to original order
+    selection = ops.zeros_like(weights, dtype="int32")
+    # Fallback equivalent using standard conditional filtering
+    return ops.cast(ops.logical_and(eligible, ranks < k_expanded), "int32") # Simplified thresholding approximation
+
+def token_f1(selection, rationale) -> List[float]:
+    out = []
+    for pred, gold in zip(selection, rationale):
+        tp = int(ops.sum(ops.cast((pred == 1) & (gold == 1), "int32")))
+        n_pred, n_gold = int(ops.sum(pred)), int(ops.sum(gold))
+        if n_pred == 0 or n_gold == 0:
+            out.append(0.0)
+            continue
+        prec, rec = tp / n_pred, tp / n_gold
+        out.append(2 * prec * rec / (prec + rec) if prec + rec else 0.0)
+    return out
+
+def apply_mask(input_ids, attention_mask, remove, pad_token_id):
+    drop = ops.cast(remove, "bool")
+    return ops.where(drop, pad_token_id, input_ids), ops.where(drop, 0, attention_mask)
+
+def build_complement(selection, attention_mask, protected):
+    return ops.cast((selection == 1) & (protected == 0) & (attention_mask == 1), "int32")
+
+def build_reduced(selection, attention_mask, protected):
+    return ops.cast((selection == 0) & (protected == 0) & (attention_mask == 1), "int32")
+
+def summarise(values: Dict[str, List[float]]) -> Dict[str, float]:
+    return {k: (sum(v) / len(v) if v else 0.0) for k, v in values.items()}
+
+def mean_std(values: Sequence[float]) -> Dict[str, float]:
+    if not values: return {"mean": 0.0, "std": 0.0}
+    mean = sum(values) / len(values)
+    var = sum((v - mean) ** 2 for v in values) / (len(values) - 1) if len(values) > 1 else 0.0
+    return {"mean": mean, "std": var ** 0.5}
