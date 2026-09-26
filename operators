@@ -1,0 +1,19 @@
+from __future__ import annotations
+import keras
+from keras import ops
+
+def head_averaged_attention(attn):
+    return ops.mean(attn, axis=1)
+
+def self_attention_score(attn_mean):
+    return ops.diagonal(attn_mean, axis1=-2, axis2=-1)
+
+def decayed_cummax_step(prev, current, gamma):
+    return ops.maximum(current, gamma * prev)
+
+def evidence_weights(accumulated, padding_mask):
+    scores = ops.where(padding_mask, -1e9, accumulated)
+    return ops.softmax(scores, axis=-1)
+
+def evidence_pooling(hidden, weights):
+    return ops.einsum("bt,btd->bd", weights, hidden)
