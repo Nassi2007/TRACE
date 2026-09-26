@@ -1,0 +1,55 @@
+from __future__ import annotations
+import os   
+os.environ["KERAS_BACKEND"] = "torch" 
+import argparse, sys, keras
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from trace.data import build_dataloaders
+from trace.engine import TrainConfig, evaluate, train
+from trace.modeling import TraceConfig, TraceModel
+from trace.utils import load_config, save_json, set_seed
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    for arg, kwargs in [("--config", {"required": True, "help": "path to a YAML config"}),
+                        ("--data-root", {"required": True, "help": "root of the ERASER release"}),
+                        ("--seed", {"type": int, "default": 42}),
+                        ("--out", {"required": True, "help": "where to write the result JSON"}),
+                        ("--quiet", {"action": "storing_true", "help": "suppress logs"})]:
+        p.add_argument(arg, **kwargs)
+    return p.parse_args()
+
+def main() -> None:
+    args = parse_args()
+    cfg, verbose = load_config(args.config), not args.quiet
+    set_seed(args.seed)
+    
+    from transformers import AutoTokenizer
+    model_cfg, train_cfg = TraceConfig(**cfg["model"]), TrainConfig()
+    tokenizer = AutoTokenizer.from_pretrained(model_cfg.backbone, use_fast=True)
+    
+    loaders, sizes = build_dataloaders(root=args.data_root, dataset=cfg["dataset"], tokenizer=tokenizer, batch_size=train_cfg.batch_size, max_length=cfg.get("max_length", 512))
+    model = TraceModel(model_cfg)
+    
+    if verbose:
+        print(f"dataset={cfg['dataset']} seed={args.seed}\nsplits={sizes} trainable params={sum(keras.backend.count_params(w) for w in model.trainable_weights):,}")
+
+    summary = train(model, loaders, pad_token_id=tokenizer.pad_token_id, cfg=train_cfg, verbose=verbose)
+    test = evaluate(model, loaders["test"], pad_token_id=tokenizer.pad_token_id, compute_faithfulness=True)
+    
+    record = {
+        "dataset": cfg["dataset"], "seed": args.seed, "splits": sizes,
+        "model_config": model_cfg.to_dict() if hasattr(model_cfg, "to_dict") else model_cfg.__dict__,
+        "train_config": train_cfg.__dict__, "best_epoch": summary["best_epoch"],
+        "best_val_macro_f1": summary["best_val_macro_f1"], "test": test,
+        "history": summary["history"], "keras_version": keras.__version__, "backend": keras.backend.backend()
+    }
+    save_json(record, args.out)
+    
+    if verbose:
+        print("\ntest results")
+        for key in ("macro_f1", "macro_f1_rationale_only", "token_f1", "comprehensiveness", "sufficiency"):
+            print(f"  {key:26s} {test[key]:.4f}")
+        print(f"\nwritten to {args.out}")
+
+if __name__ == "__main__":
+    main()
