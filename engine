@@ -1,0 +1,70 @@
+from __future__ import annotations
+import time
+from typing import Dict, List
+import keras
+from keras import ops
+from .metrics import apply_mask, build_complement, build_reduced, macro_f1, select_topk, token_f1
+
+class TrainConfig:
+    lr, weight_decay, batch_size, max_epochs, patience, max_grad_norm, backbone_lr = 2e-4, 1e-2, 32, 40, 15, 1.0, 2e-5
+
+def _model_inputs(batch: Dict) -> Dict:
+    return {k: batch[k] for k in ("input_ids", "attention_mask", "token_type_ids") if k in batch}
+
+def evaluate(model, loader, pad_token_id: int, compute_faithfulness: bool = True) -> Dict[str, float]:
+    y_true, y_pred_full, y_pred_reduced, tok_f1, comp, suff = [], [], [], [], [], []
+    for batch in loader:
+        inputs = _model_inputs(batch)
+        out = model(inputs, training=False)
+        probs, pred = ops.softmax(out["logits"], axis=-1), ops.argmax(out["logits"], axis=-1)
+        y_true.extend(batch["labels"].numpy().tolist() if hasattr(batch["labels"], "numpy") else list(batch["labels"]))
+        y_pred_full.extend(pred.numpy().tolist() if hasattr(pred, "numpy") else list(pred))
+        
+        selection = select_topk(out["weights"], batch["attention_mask"], batch["protected"], ops.sum(batch["rationale"], axis=1))
+        tok_f1.extend(token_f1(selection, batch["rationale"]))
+        if not compute_faithfulness: continue
+        
+        p_full = ops.squeeze(ops.take_along_axis(probs, ops.expand_dims(pred, -1), axis=-1), axis=-1)
+        drop = build_complement(selection, batch["attention_mask"], batch["protected"])
+        ids_c, mask_c = apply_mask(batch["input_ids"], batch["attention_mask"], drop, pad_token_id)
+        p_comp = ops.squeeze(ops.take_along_axis(ops.softmax(model({**inputs, "input_ids": ids_c, "attention_mask": mask_c}, training=False)["logits"], axis=-1), ops.expand_dims(pred, -1), axis=-1), axis=-1)
+        comp.extend((p_full - p_comp).numpy().tolist() if hasattr(p_full - p_comp, "numpy") else list(p_full - p_comp))
+        
+        keep = build_reduced(selection, batch["attention_mask"], batch["protected"])
+        ids_s, mask_s = apply_mask(batch["input_ids"], batch["attention_mask"], keep, pad_token_id)
+        logits_s = model({**inputs, "input_ids": ids_s, "attention_mask": mask_s}, training=False)["logits"]
+        p_suff = ops.squeeze(ops.take_along_axis(ops.softmax(logits_s, axis=-1), ops.expand_dims(pred, -1), axis=-1), axis=-1)
+        suff.extend((p_full - p_suff).numpy().tolist() if hasattr(p_full - p_suff, "numpy") else list(p_full - p_suff))
+        y_pred_reduced.extend(ops.argmax(logits_s, axis=-1).numpy().tolist() if hasattr(ops.argmax(logits_s, axis=-1), "numpy") else list(ops.argmax(logits_s, axis=-1)))
+        
+    results = {"macro_f1": macro_f1(y_true, y_pred_full), "token_f1": sum(tok_f1) / len(tok_f1) if tok_f1 else 0.0}
+    if compute_faithfulness:
+        results.update(macro_f1_rationale_only=macro_f1(y_true, y_pred_reduced), comprehensiveness=sum(comp) / len(comp) if comp else 0.0, sufficiency=sum(suff) / len(suff) if suff else 0.0)
+    return results
+
+def train(model, loaders, pad_token_id: int, cfg: TrainConfig, log_every: int = 50, verbose: bool = True) -> Dict:
+    optimizer, criterion = keras.optimizers.AdamW(learning_rate=cfg.lr, weight_decay=cfg.weight_decay), keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+    best_score, best_state, best_epoch, history, since_improved = -1.0, None, -1, [], 0
+    for epoch in range(1, cfg.max_epochs + 1):
+        running, seen = 0.0, 0
+        for step, batch in enumerate(loaders["train"], start=1):
+            inputs, labels = _model_inputs(batch), batch["labels"]
+            with keras.GradientTape() as tape:
+                loss = criterion(labels, model(inputs, training=True)["logits"])
+            grads = tape.gradient(loss, model.trainable_variables)
+            if cfg.max_grad_norm: grads, _ = ops.clip_by_global_norm(grads, cfg.max_grad_norm)
+            optimizer.apply_gradients(zip(grads, model.trainable_variables))
+            running, seen = running + float(loss) * int(ops.shape(labels)[0]), seen + int(ops.shape(labels)[0])
+            if verbose and log_every and step % log_every == 0:
+                print(f"  epoch {epoch} step {step} loss {running / max(seen, 1):.4f}", flush=True)
+        val = evaluate(model, loaders["val"], pad_token_id, compute_faithfulness=False)
+        history.append({"epoch": epoch, "train_loss": running / max(seen, 1), **val})
+        if val["macro_f1"] > best_score:
+            best_score, best_state, best_epoch, since_improved = val["macro_f1"], [v.numpy() for v in model.weights], epoch, 0
+        else:
+            since_improved += 1
+            if since_improved >= cfg.patience: break
+    if best_state is not None:
+        for v, w in zip(model.weights, best_state): v.assign(w)
+    return {"best_epoch": best_epoch, "best_val_macro_f1": best_score, "history": history}
+
