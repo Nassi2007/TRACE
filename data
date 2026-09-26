@@ -1,0 +1,48 @@
+from __future__ import annotations
+import json, os
+from typing import Dict, List
+import numpy as np
+
+LABEL_MAPS = {"movies": {"NEG": 0, "POS": 1}, "multirc": {"False": 0, "True": 1}}
+
+class EraserDataset:
+    def __init__(self, root: str, dataset: str, split: str, tokenizer, max_length: int = 512) -> None:
+        base, docs_dir = os.path.join(root, dataset), os.path.join(root, dataset, "docs")
+        with open(os.path.join(base, f"{split}.jsonl"), encoding="utf-8") as f:
+            self.records = [json.loads(line) for line in f if line.strip()]
+        self.tok, self.max_length, self.dataset, self.label_map, self.doc_cache = tokenizer, max_length, dataset, LABEL_MAPS[dataset], {}
+        if not getattr(tokenizer, "is_fast", False): raise ValueError("Fast tokenizer required")
+
+    def __len__(self) -> int: return len(self.records)
+
+    def __getitem__(self, idx: int) -> Dict[str, np.ndarray]:
+        rec = self.records[idx]
+        spans = [(ev["docid"], int(ev["start_token"]), int(ev["end_token"])) for group in rec.get("evidences", []) for ev in group if ev.get("start_token", -1) >= 0]
+        docid = spans[0][0]
+        if docid not in self.doc_cache:
+            path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", docid) # or docs_dir
+            for ext in ("", ".txt", ".json"):
+                if os.path.exists(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", docid + ext)):
+                    with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", docid + ext), encoding="utf-8") as fh:
+                        self.doc_cache[docid] = fh.read().split()
+                    break
+        words = self.doc_cache.get(docid, [])
+        mask = [1 if any(start <= i < end for _, start, end in spans) else 0 for i in range(len(words))]
+        
+        if self.dataset == "multirc":
+            enc = self.tok(str(rec.get("query", "")).split(), words, is_split_into_words=True, truncation="only_second", max_length=self.max_length, padding="max_length", return_tensors=None)
+            p_id = 1
+        else:
+            enc = self.tok(words, is_split_into_words=True, truncation=True, max_length=self.max_length, padding="max_length", return_tensors=None)
+            p_id = 0
+            
+        word_ids, seq_ids = enc.word_ids(), enc.sequence_ids()
+        rationale = [mask[wid] if wid is not None and sid == p_id and wid < len(mask) else 0 for wid, sid in zip(word_ids, seq_ids)]
+        special = [1 if wid is None or sid != p_id else 0 for wid, sid in zip(word_ids, seq_ids)]
+
+        item = {k: np.array(v, dtype=np.int64) for k, v in {"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"], "labels": self.label_map[str(rec["classification"])], "rationale": rationale, "protected": special}.items()}
+        if "token_type_ids" in enc: item["token_type_ids"] = np.array(enc["token_type_ids"], dtype=np.int64)
+        return item
+
+def build_dataloaders(root: str, dataset: str, tokenizer, batch_size = 32, max_length = 512):
+    return {s: EraserDataset(root, dataset, s, tokenizer, max_length) for s in ("train", "val", "test")}, {s: len(EraserDataset(root, dataset, s, tokenizer, max_length)) for s in ("train", "val", "test")}
