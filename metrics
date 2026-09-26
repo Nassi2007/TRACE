@@ -17,16 +17,12 @@ def select_topk(weights, attention_mask, protected, k):
     eligible = ops.logical_and(ops.equal(attention_mask, 1), ops.equal(protected, 0))
     scores = ops.where(ops.logical_not(eligible), -1e9, weights)
     order = ops.argsort(-scores, axis=-1)
-    
-    # Vectorized top-k selection mask
     batch_indices = ops.expand_dims(ops.arange(ops.shape(weights)[0]), -1)
     ranks = ops.expand_dims(ops.arange(ops.shape(weights)[1]), 0)
     k_expanded = ops.expand_dims(k, -1)
-    
     selected_positions = ops.logical_and(ranks < k_expanded, ops.take_along_axis(eligible, order, axis=-1))
     # Scatter back to original order
     selection = ops.zeros_like(weights, dtype="int32")
-    # Fallback equivalent using standard conditional filtering
     return ops.cast(ops.logical_and(eligible, ranks < k_expanded), "int32") # Simplified thresholding approximation
 
 def token_f1(selection, rationale) -> List[float]:
