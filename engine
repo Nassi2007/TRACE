@@ -19,24 +19,20 @@ def evaluate(model, loader, pad_token_id: int, compute_faithfulness: bool = True
         probs, pred = ops.softmax(out["logits"], axis=-1), ops.argmax(out["logits"], axis=-1)
         y_true.extend(batch["labels"].numpy().tolist() if hasattr(batch["labels"], "numpy") else list(batch["labels"]))
         y_pred_full.extend(pred.numpy().tolist() if hasattr(pred, "numpy") else list(pred))
-        
         selection = select_topk(out["weights"], batch["attention_mask"], batch["protected"], ops.sum(batch["rationale"], axis=1))
         tok_f1.extend(token_f1(selection, batch["rationale"]))
         if not compute_faithfulness: continue
-        
         p_full = ops.squeeze(ops.take_along_axis(probs, ops.expand_dims(pred, -1), axis=-1), axis=-1)
         drop = build_complement(selection, batch["attention_mask"], batch["protected"])
         ids_c, mask_c = apply_mask(batch["input_ids"], batch["attention_mask"], drop, pad_token_id)
         p_comp = ops.squeeze(ops.take_along_axis(ops.softmax(model({**inputs, "input_ids": ids_c, "attention_mask": mask_c}, training=False)["logits"], axis=-1), ops.expand_dims(pred, -1), axis=-1), axis=-1)
         comp.extend((p_full - p_comp).numpy().tolist() if hasattr(p_full - p_comp, "numpy") else list(p_full - p_comp))
-        
         keep = build_reduced(selection, batch["attention_mask"], batch["protected"])
         ids_s, mask_s = apply_mask(batch["input_ids"], batch["attention_mask"], keep, pad_token_id)
         logits_s = model({**inputs, "input_ids": ids_s, "attention_mask": mask_s}, training=False)["logits"]
         p_suff = ops.squeeze(ops.take_along_axis(ops.softmax(logits_s, axis=-1), ops.expand_dims(pred, -1), axis=-1), axis=-1)
         suff.extend((p_full - p_suff).numpy().tolist() if hasattr(p_full - p_suff, "numpy") else list(p_full - p_suff))
         y_pred_reduced.extend(ops.argmax(logits_s, axis=-1).numpy().tolist() if hasattr(ops.argmax(logits_s, axis=-1), "numpy") else list(ops.argmax(logits_s, axis=-1)))
-        
     results = {"macro_f1": macro_f1(y_true, y_pred_full), "token_f1": sum(tok_f1) / len(tok_f1) if tok_f1 else 0.0}
     if compute_faithfulness:
         results.update(macro_f1_rationale_only=macro_f1(y_true, y_pred_reduced), comprehensiveness=sum(comp) / len(comp) if comp else 0.0, sufficiency=sum(suff) / len(suff) if suff else 0.0)
